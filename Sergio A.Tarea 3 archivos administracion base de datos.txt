@@ -1,0 +1,198 @@
+# Crear carpeta del proyecto
+cd /home/vboxuser
+mkdir bigdata-spark-analisis
+cd bigdata-spark-analisis
+
+# Crear archivo de análisis batch
+cat > analisis_ventas.py << 'EOF'
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum, avg, count, round
+
+spark = SparkSession.builder.appName("AnalisisVentas").getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+print("\n" + "="*60)
+print("ANALISIS DE VENTAS CON SPARK BATCH")
+print("="*60)
+
+df = spark.read.csv("ventas.csv", header=True, inferSchema=True)
+
+print("\nEsquema de los datos:")
+df.printSchema()
+
+print("\nPrimeros 5 registros:")
+df.show(5)
+
+df = df.withColumn("total_venta", col("precio") * col("cantidad"))
+
+print("\nVentas por categoria:")
+df.groupBy("categoria").agg(
+    round(sum("total_venta"), 2).alias("venta_total"),
+    count("producto").alias("num_ventas")
+).orderBy(col("venta_total").desc()).show()
+
+print("\nVentas por ciudad:")
+df.groupBy("ciudad").agg(
+    round(sum("total_venta"), 2).alias("venta_total"),
+    count("producto").alias("num_ventas")
+).orderBy(col("venta_total").desc()).show()
+
+print("\nProducto mas vendido:")
+df.groupBy("producto").agg(
+    sum("cantidad").alias("total_cantidad"),
+    round(sum("total_venta"), 2).alias("total_venta")
+).orderBy(col("total_cantidad").desc()).show(5)
+
+total_ventas = df.agg(sum("total_venta")).collect()[0][0]
+total_transacciones = df.agg(count("producto")).collect()[0][0]
+
+print(f"\nTotal de ventas: ${total_ventas:,.2f}")
+print(f"Total transacciones: {total_transacciones}")
+
+print("\n" + "="*60)
+print("ANALISIS COMPLETADO")
+print("="*60 + "\n")
+
+spark.stop()
+EOF
+
+# Crear dataset de ventas
+cat > ventas.csv << 'EOF'
+fecha,producto,categoria,precio,cantidad,ciudad
+2024-01-15,Laptop,Electronica,800,2,Bogota
+2024-01-15,Teclado,Electronica,50,5,Medellin
+2024-01-16,Mouse,Electronica,25,10,Bogota
+2024-01-16,Monitor,Electronica,300,3,Cali
+2024-01-17,Libreta,Papeleria,5,20,Bogota
+2024-01-17,Lapiz,Papeleria,2,30,Medellin
+2024-01-18,Laptop,Electronica,800,1,Cali
+2024-01-18,Teclado,Electronica,50,4,Bogota
+2024-01-19,Mouse,Electronica,25,8,Medellin
+2024-01-19,Libreta,Papeleria,5,15,Cali
+2024-01-20,Lapiz,Papeleria,2,25,Bogota
+2024-01-20,Monitor,Electronica,300,2,Medellin
+2024-01-21,Laptop,Electronica,800,3,Medellin
+2024-01-21,Teclado,Electronica,50,6,Cali
+2024-01-22,Mouse,Electronica,25,12,Bogota
+2024-01-22,Libreta,Papeleria,5,18,Medellin
+EOF
+
+# Crear productor Kafka
+cat > kafka_producer.py << 'EOF'
+import time
+import json
+import random
+from kafka import KafkaProducer
+
+def generate_sensor_data():
+    return {
+        "sensor_id": random.randint(1, 10),
+        "temperature": round(random.uniform(20, 30), 2),
+        "humidity": round(random.uniform(30, 70), 2),
+        "timestamp": int(time.time())
+    }
+
+producer = KafkaProducer(
+    bootstrap_servers=["localhost:9092"],
+    value_serializer=lambda x: json.dumps(x).encode("utf-8")
+)
+
+print("Enviando datos de sensores a Kafka...")
+while True:
+    sensor_data = generate_sensor_data()
+    producer.send("sensor_data", value=sensor_data)
+    print(f"Sent: {sensor_data}")
+    time.sleep(1)
+EOF
+
+# Crear consumidor Spark Streaming
+cat > spark_streaming_consumer.py << 'EOF'
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, window, to_timestamp, from_unixtime
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType
+
+spark = SparkSession.builder.appName("SensorDataAnalysis").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+schema = StructType([
+    StructField("sensor_id", IntegerType()),
+    StructField("temperature", FloatType()),
+    StructField("humidity", FloatType()),
+    StructField("timestamp", IntegerType())
+])
+
+df = spark.readStream.format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "sensor_data") \
+    .option("startingOffsets", "latest") \
+    .load()
+
+parsed_df = df.select(
+    from_json(col("value").cast("string"), schema).alias("data")
+).select(
+    col("data.sensor_id"),
+    col("data.temperature"),
+    col("data.humidity"),
+    to_timestamp(from_unixtime(col("data.timestamp"))).alias("timestamp")
+)
+
+windowed_stats = parsed_df.groupBy(
+    window(col("timestamp"), "1 minute"),
+    col("sensor_id")
+).agg(
+    {"temperature": "avg", "humidity": "avg"}
+).select(
+    col("window"),
+    col("sensor_id"),
+    col("avg(temperature)").alias("avg_temperature"),
+    col("avg(humidity)").alias("avg_humidity")
+)
+
+query = windowed_stats.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .option("truncate", "false") \
+    .start()
+
+query.awaitTermination()
+EOF
+
+# Crear archivo de dependencias
+cat > requirements.txt << 'EOF'
+pyspark==3.5.3
+kafka-python==2.0.2
+EOF
+
+# Crear archivo README
+cat > README.md << 'EOF'
+# Análisis de Ventas con Apache Spark - Big Data UNAD
+
+## Descripción
+Proyecto para la Tarea 3 del curso de Big Data que implementa:
+- **Procesamiento Batch**: Análisis de ventas de una tienda
+- **Procesamiento Streaming**: Datos de sensores con Kafka y Spark Streaming
+
+## Resultados del Análisis Batch
+| Análisis | Resultado |
+|----------|-----------|
+| Ventas Electrónica | $7,800 |
+| Ventas Papelería | $375 |
+| Ciudad con más ventas | Medellín ($3,600) |
+| Producto más vendido | Lápiz (55 unidades) |
+| Total ventas | $8,175 |
+
+## Cómo ejecutar
+
+### Análisis Batch
+```bash
+spark-submit analisis_ventas.py
+
+# Iniciar Kafka
+cd /opt/Kafka && sudo bin/kafka-server-start.sh config/kraft/server.properties
+
+# Productor
+python3 kafka_producer.py
+
+# Consumidor Spark
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 spark_streaming_consumer.py
+
